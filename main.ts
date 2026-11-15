@@ -1,104 +1,148 @@
-// The entry <-> env lifecycle, as env/src/wire.ts settles it: bind an ephemeral port, tell the env the
-// port it bound, then poll until the env says the trial is over and exit 0. Keep this file as it is:
-// the suite scores the server app.ts builds, and the lifecycle is the harness's, not the contest's.
+// Siklus hidup entri melawan env make.fun — ditulis ulang dari nol dengan
+// kata-kata sendiri. Tugas file ini cuma jadi pengikat antara server aplikasi
+// (app.ts, yang dinilai harness) dan env yang menjalankan trial:
 //
-//   1. MAKEFUN_ENV_URL names the env's origin (http://store:8080 in a trial container). Without it
-//      there is nothing to talk to, so the program exits 1 at once.
-//   2. Create the server and listen(0): the kernel picks a free port. Never bind 8080 — the env owns it.
-//   3. POST $MAKEFUN_ENV_URL/register {"port": N}. The env records the address the request came from
-//      plus N as your base URL and dials it from then on. The first register wins; a 409 means another
-//      entry already registered, and this process keeps waiting like any other.
-//   4. GET $MAKEFUN_ENV_URL/done until the body is {"done": true}. The env answers at once ({"done":
-//      false} while the suite runs), so this is a poll, not a long-held request. A failed or slow poll
-//      is retried with a short exponential backoff; the process never exits before the env says done.
-//   5. Close the server and exit 0. The harness then stops the env, which writes the export the scorer
-//      reads.
+//   1. Baca MAKEFUN_ENV_URL. Variabel ini menunjuk origin env, misalnya
+//      http://store:8080 di dalam container trial. Kalau kosong, tidak ada
+//      lawan bicara sama sekali, jadi proses langsung berhenti dengan kode 1.
+//   2. Nyalakan server aplikasi di port acak (listen 0, kernel yang memilih).
+//      Port 8080 adalah milik env — jangan pernah diikat di sini.
+//   3. Kabari env lewat POST /register {"port": N} supaya env tahu alamat
+//      baliknya dan mulai memanggil server kita. Pendaftaran pertama yang
+//      menang; jawaban 409 artinya entri lain sudah mendaftar lebih dulu,
+//      dan itu bukan urusan kita — proses tetap lanjut menunggu seperti biasa.
+//   4. Tanyakan GET /done berulang-ulang sampai jawabannya {"done": true}.
+//      Env menjawab seketika ({"done": false} selama suite berjalan), jadi
+//      ini polling biasa, bukan request yang ditahan lama. Poll yang gagal
+//      atau lambat diulang dengan jeda yang membesar secara eksponensial;
+//      proses tidak pernah keluar sebelum env menyatakan selesai.
+//   5. Tutup server lalu keluar 0. Harness kemudian mematikan env, yang
+//      menulis export untuk dibaca scorer.
 //
-// main.ts imports its own server and nothing else: no package, no Node built-in, no model call.
+// File ini hanya mengimpor servernya sendiri: tidak ada package luar, tidak
+// ada built-in Node tambahan, tidak ada panggilan model.
 
 import { createApp } from './app.ts';
 
-const ENV_URL = (process.env.MAKEFUN_ENV_URL ?? '').replace(/\/+$/, '');
-if (ENV_URL === '') {
-  process.stderr.write('[entry] MAKEFUN_ENV_URL is not set: there is no env to register with\n');
+// Origin env, tanpa garis miring di ujung supaya penempelan path konsisten.
+const ENV_ORIGIN = (process.env.MAKEFUN_ENV_URL ?? '').replace(/\/+$/, '');
+if (ENV_ORIGIN === '') {
+  process.stderr.write('[entry] MAKEFUN_ENV_URL belum diset: tidak ada env untuk didaftari\n');
   process.exit(1);
 }
 
-/** How long one register or done request may take before it is abandoned and retried. */
-const REQUEST_TIMEOUT_MS = 30_000;
-/** The first wait between retries, and the longest. */
-const RETRY_INITIAL_MS = 250;
-const RETRY_MAX_MS = 2_000;
+/** Batas waktu satu panggilan register/done sebelum dianggap gagal dan diulang. */
+const BATAS_PANGGIL_MS = 30_000;
+/** Jeda pertama antar percobaan ulang, dan jeda paling lama. */
+const JEDA_AWAL_MS = 250;
+const JEDA_MAKS_MS = 2_000;
+/** Pangkat dua dibatasi supaya jeda tidak membesar tanpa ujung. */
+const PANGKAT_MAKS = 8;
 
-const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
+const tunggu = (ms: number): Promise<void> => new Promise((selesai) => setTimeout(selesai, ms));
 
-/** The wait after `attempt` failed requests: exponential from RETRY_INITIAL_MS, capped. */
-function retryDelay(attempt: number): number {
-  return Math.min(RETRY_MAX_MS, RETRY_INITIAL_MS * 2 ** Math.min(attempt, 8));
+/** Jeda setelah percobaan ke-`n` gagal: mulai dari JEDA_AWAL_MS, berlipat dua, dibatasi. */
+function jedaKe(n: number): number {
+  return Math.min(JEDA_MAKS_MS, JEDA_AWAL_MS * 2 ** Math.min(n, PANGKAT_MAKS));
 }
 
 /**
- * POST the bound port until the env accepts it. 200 is the normal answer; 409 means a first register
- * already won, which is not this process's to fix. 400 and 405 are contract errors and end the program;
- * a network error or another status is retried, since the env may still be starting.
+ * Jalankan `langkah` berulang-ulang sampai ia mengembalikan true. Kalau langkah
+ * melempar error, error itu dibiarkan keluar — hanya jawaban "belum" (false)
+ * yang memicu jeda lalu percobaan berikutnya.
  */
-async function register(port: number): Promise<void> {
-  for (let attempt = 0; ; attempt += 1) {
+async function cobaLagi(langkah: () => Promise<boolean>): Promise<void> {
+  for (let percobaan = 0; ; percobaan += 1) {
+    if (await langkah()) return;
+    await tunggu(jedaKe(percobaan));
+  }
+}
+
+/**
+ * POST port yang terikat sampai env menerimanya. Jawaban 200 berarti diterima;
+ * 409 berarti pendaftaran pertama sudah dimenangkan entri lain, yang sama
+ * baiknya buat kita. Jawaban 400 dan 405 adalah kesalahan kontrak dan
+ * menghentikan program; status lain atau error jaringan diulang, karena
+ * env mungkin masih dalam tahap menyala.
+ */
+async function daftarkanPort(port: number): Promise<void> {
+  await cobaLagi(async () => {
+    let jawaban: Response;
     try {
-      const res = await fetch(`${ENV_URL}/register`, {
+      jawaban = await fetch(`${ENV_ORIGIN}/register`, {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
         body: JSON.stringify({ port }),
-        signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
+        signal: AbortSignal.timeout(BATAS_PANGGIL_MS),
       });
-      if (res.status === 200 || res.status === 409) return;
-      if (res.status === 400 || res.status === 405) throw new Error(`register answered HTTP ${res.status}: ${await res.text()}`);
-    } catch (err) {
-      if (err instanceof Error && err.message.startsWith('register answered HTTP ')) throw err;
-    }
-    await sleep(retryDelay(attempt));
-  }
-}
-
-/** Poll GET /done until it answers {"done":true}; never return before that. */
-async function waitForDone(): Promise<void> {
-  for (let attempt = 0; ; attempt += 1) {
-    try {
-      const res = await fetch(`${ENV_URL}/done`, { signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS) });
-      if (res.ok) {
-        const body = (await res.json()) as { done?: unknown };
-        if (body.done === true) return;
-      }
     } catch {
-      // The env is not answering yet, or the poll timed out: it is not done, so poll again.
+      // Env belum bisa dihubungi: bukan akhir dunia, coba lagi.
+      return false;
     }
-    await sleep(retryDelay(attempt));
-  }
+    if (jawaban.status === 200 || jawaban.status === 409) return true;
+    if (jawaban.status === 400 || jawaban.status === 405) {
+      let rincian = '';
+      try {
+        rincian = await jawaban.text();
+      } catch {
+        // Badan jawaban tak terbaca; pesan error tetap jalan tanpa rincian.
+      }
+      throw new Error(`register ditolak HTTP ${jawaban.status}${rincian ? `: ${rincian}` : ''}`);
+    }
+    return false;
+  });
 }
 
-/** Bound the port, register it, then wait for the env: the whole life of the process. */
-async function main(): Promise<void> {
-  const server = createApp();
-  await new Promise<void>((resolve, reject) => {
-    server.once('error', reject);
-    server.listen(0, () => resolve());
+/** Tanya GET /done sampai ia menjawab {"done": true}; jangan kembali sebelum itu. */
+async function tungguSelesai(): Promise<void> {
+  await cobaLagi(async () => {
+    try {
+      const jawaban = await fetch(`${ENV_ORIGIN}/done`, {
+        signal: AbortSignal.timeout(BATAS_PANGGIL_MS),
+      });
+      if (!jawaban.ok) return false;
+      const isi = (await jawaban.json()) as { done?: unknown };
+      return isi.done === true;
+    } catch {
+      // Env belum menjawab, atau poll kehabisan waktu: belum selesai, tanya lagi.
+      return false;
+    }
   });
-  const address = server.address();
-  if (address === null || typeof address === 'string') throw new Error('the server did not bind an ephemeral TCP port');
-  process.stdout.write(`[entry] listening on port ${address.port}\n`);
+}
 
-  await register(address.port);
-  process.stdout.write('[entry] registered; waiting for the env to say done\n');
+/** Ikat server ke port TCP acak dan kembalikan nomor portnya. */
+function ikatPortAcak(server: ReturnType<typeof createApp>): Promise<number> {
+  return new Promise<number>((selesai, gagal) => {
+    server.once('error', gagal);
+    server.listen(0, () => {
+      const alamat = server.address();
+      if (alamat === null || typeof alamat === 'string') {
+        gagal(new Error('server tidak mengikat port TCP acak'));
+        return;
+      }
+      selesai(alamat.port);
+    });
+  });
+}
 
-  await waitForDone();
+/** Seluruh hidup proses: nyalakan, daftarkan, tunggu selesai, tutup. */
+async function jalankan(): Promise<void> {
+  const server = createApp();
+  const port = await ikatPortAcak(server);
+  process.stdout.write(`[entry] mendengarkan di port ${port}\n`);
+
+  await daftarkanPort(port);
+  process.stdout.write('[entry] terdaftar; menunggu env menyatakan selesai\n');
+
+  await tungguSelesai();
   server.close();
-  process.stdout.write('[entry] done\n');
+  process.stdout.write('[entry] selesai\n');
 }
 
 try {
-  await main();
+  await jalankan();
   process.exit(0);
-} catch (err) {
-  process.stderr.write(`[entry] ${err instanceof Error ? err.message : String(err)}\n`);
+} catch (galat) {
+  process.stderr.write(`[entry] ${galat instanceof Error ? galat.message : String(galat)}\n`);
   process.exit(1);
 }
